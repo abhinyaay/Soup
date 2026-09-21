@@ -20,13 +20,23 @@ def cuda_available() -> bool:
     to select. Gate a test that needs CUDA with ``@pytest.mark.gpu`` (optionally
     ``@pytest.mark.gpu(reason="...")``) rather than calling this in a skip;
     ``tests/test_issue833_gpu_marker.py`` holds that line.
+
+    The question a ``gpu`` marker actually asks is "is there a device to run
+    on", which is ``device_count() > 0`` — not ``is_available()``, which only
+    says "torch was built with CUDA and can initialise" and stays True when no
+    device is visible (e.g. under ``CUDA_VISIBLE_DEVICES=""``). Gating on the
+    build let the marker fail open, running a ``gpu`` test on a machine with no
+    visible device and failing it instead of skipping (#1128); requiring a
+    device is the fix. ``torch.cuda.device_count()`` returns 0 rather than
+    raising in that state, and the ``and`` short-circuits so it is only reached
+    once the build is present.
     """
     try:
         import torch
     except ImportError:
         return False
     try:
-        return bool(torch.cuda.is_available())
+        return bool(torch.cuda.is_available() and torch.cuda.device_count() > 0)
     except Exception:  # noqa: BLE001 — a broken CUDA install counts as no CUDA
         return False
 
