@@ -1,0 +1,170 @@
+"""soup expect — Expectations suite for chat data (v0.69.0 Part B).
+
+Runs a YAML suite of expectations against a JSONL dataset. A suite failure
+exits 2 (EXIT_GATE_FAILED, the gate convention), so CI pipelines can gate on
+dataset quality regressions without parsing output; a usage or input error
+(missing/invalid paths) exits 3 (EXIT_USAGE_ERROR). See utils/exit_codes.py.
+"""
+
+from __future__ import annotations
+
+import json
+import os
+from typing import List, Mapping, Optional
+
+import typer
+from rich.console import Console
+from rich.markup import escape
+from rich.panel import Panel
+from rich.table import Table
+
+from soup_cli.utils.exit_codes import EXIT_GATE_FAILED, EXIT_RUNTIME_ERROR, EXIT_USAGE_ERROR
+
+console = Console()
+
+_MAX_DATA_BYTES = 1_073_741_824  # 1 GiB cap on input data
+_MAX_DATA_ROWS = 1_000_000
+
+
+def _load_jsonl_rows(data_path: str) -> List[Mapping[str, object]]:
+    """Cwd-contained + symlink-rejected JSONL loader.
+
+    Delegates to ``utils.paths.enforce_under_cwd_and_no_symlink`` (v0.59.0
+    centralised TOCTOU helper) for the path-validation pre-check.
+    """
+    from soup_cli.utils.paths import enforce_under_cwd_and_no_symlink
+
+    if not isinstance(data_path, str) or not data_path:
+        raise ValueError("data path must be a non-empty string")
+    if not os.path.lexists(data_path):
+        raise FileNotFoundError(f"data file not found: {data_path}")
+    enforce_under_cwd_and_no_symlink(data_path, "data path")
+    real = os.path.realpath(data_path)
+    if not os.path.isfile(real):
+        raise FileNotFoundError(f"data file not found: {data_path}")
+    if os.path.getsize(real) > _MAX_DATA_BYTES:
+        raise ValueError(f"data file exceeds {_MAX_DATA_BYTES} bytes")
+    rows: List[Mapping[str, object]] = []
+    uncheckable: List[str] = []
+    with open(real, "r", encoding="utf-8-sig") as handle:
+        for line_no, line in enumerate(handle, start=1):
+            if not line.strip():
+                continue
+            if line_no > _MAX_DATA_ROWS:
+                raise ValueError(f"data file exceeds {_MAX_DATA_ROWS} rows")
+            try:
+                row = json.loads(line)
+            except json.JSONDecodeError:
+                uncheckable.append(f"line {line_no}: malformed JSON")
+                continue
+            if isinstance(row, dict):
+                rows.append(row)
+            else:
+                uncheckable.append(f"line {line_no}: not a JSON object")
+    if uncheckable:
+        shown = uncheckable[:10]
+        more = f" (+{len(uncheckable) - 10} more)" if len(uncheckable) > 10 else ""
+        raise ValueError(
+            f"refusing {data_path}: {len(uncheckable)} line(s) could not be checked: "
+            + "; ".join(shown)
+            + more
+        )
+    if not rows:
+        raise ValueError(
+            f"refusing {data_path}: no checkable rows were found; "
+            "a run that checked zero rows cannot pass"
+        )
+    return rows
+
+
+def expect_cmd(
+    data: str = typer.Argument(..., help="Path to JSONL dataset"),
+    suite: str = typer.Argument(..., help="Path to expectations suite YAML"),
+    judge: Optional[str] = typer.Option(
+        None,
+        "--judge",
+        help="Judge model URL (e.g. ollama://llama3.1, https://api.openai.com/gpt-4o-mini)",
+    ),
+) -> None:
+    """Run an expectations suite against a JSONL dataset.
+
+    Exit 0 = suite passed. Exit 1 = judge unreachable.
+    Exit 2 = gate failed. Exit 3 = usage/input error.
+    """
+    from soup_cli.utils.expectations import (
+        build_pairwise_judge_fn,
+        load_suite_yaml,
+        run_suite,
+    )
+
+    try:
+        spec = load_suite_yaml(suite)
+    except (FileNotFoundError, TypeError, ValueError) as exc:
+        console.print(f"[red]{escape(str(exc))}[/]")
+        raise typer.Exit(EXIT_USAGE_ERROR) from exc
+
+    try:
+        rows = _load_jsonl_rows(data)
+    except (FileNotFoundError, TypeError, ValueError) as exc:
+        console.print(f"[red]{escape(str(exc))}[/]")
+        raise typer.Exit(EXIT_USAGE_ERROR) from exc
+
+    cli_judge_fn = None
+    if judge is not None:
+        try:
+            cli_judge_fn = build_pairwise_judge_fn(judge)
+        except (ValueError, TypeError) as exc:
+            console.print(f"[red]{escape(str(exc))}[/]")
+            raise typer.Exit(EXIT_USAGE_ERROR) from exc
+        if not any(
+            e.name == "expect_chosen_preferred_over_rejected_by_judge"
+            for e in spec.expectations
+        ):
+            console.print(
+                "[yellow]note: --judge was specified, but the suite contains "
+                "no judge expectation[/]"
+            )
+
+    try:
+        report = run_suite(rows, spec, judge_fn=cli_judge_fn)
+    except (TypeError, ValueError) as exc:
+        console.print(f"[red]{escape(str(exc))}[/]")
+        raise typer.Exit(EXIT_USAGE_ERROR) from exc
+    except Exception as exc:
+        from soup_cli.eval.judge import JudgeUnavailableError
+
+        if isinstance(exc, JudgeUnavailableError):
+            console.print(f"[red]{escape(str(exc))}[/]")
+            raise typer.Exit(EXIT_RUNTIME_ERROR) from exc
+        raise
+
+    table = Table(title=f"soup expect — {escape(data)}")
+    table.add_column("Expectation")
+    table.add_column("Passed")
+    table.add_column("Rows")
+    table.add_column("Violations")
+    for result in report.results:
+        verdict = "[green]PASS[/]" if result.passed else "[red]FAIL[/]"
+        table.add_row(
+            escape(result.name),
+            verdict,
+            str(result.num_rows_checked),
+            str(result.num_violations),
+        )
+    console.print(table)
+
+    for result in report.results:
+        if result.passed and result.details:
+            for d in result.details:
+                console.print(f"[yellow]{escape(d)}[/]")
+
+    if not report.passed:
+        for result in report.results:
+            if not result.passed and result.details:
+                console.print(
+                    Panel(
+                        "\n".join(escape(d) for d in result.details),
+                        title=f"[red]Violations: {escape(result.name)}[/]",
+                    )
+                )
+        raise typer.Exit(EXIT_GATE_FAILED)
